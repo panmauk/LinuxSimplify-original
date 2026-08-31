@@ -404,6 +404,9 @@ FodyWeavers.xsd
 !.vscode/extensions.json
 !.vscode/*.code-snippets
 
+# Inno Setup compiled installer output
+installer/Output/
+
 # Local History for Visual Studio Code
 .history/
 
