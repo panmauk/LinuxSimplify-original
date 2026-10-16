@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using LinuxSimplify.Models;
@@ -6,12 +7,22 @@ namespace LinuxSimplify.Services
 {
     public class CompatibilityAnalyzer
     {
+        // The Windows app speaks to people leaving Windows ("Easiest transition from Windows"); the Linux app is used by
+        // people who already run Linux, so Windows-specific wording is swapped for neutral wording there.
+        private readonly bool windowsMigration;
+
+        public CompatibilityAnalyzer(bool windowsMigration = true)
+        {
+            this.windowsMigration = windowsMigration;
+        }
+
         private readonly List<DistroRequirements> distroDatabase = new List<DistroRequirements>
         {
             new DistroRequirements
             {
                 Name = "Ubuntu",
-                MinRamGB = 4, RecommendedRamGB = 8, MinStorageGB = 25,
+                // ubuntu.com/download/desktop lists 2 GHz dual-core, 6 GB RAM and 25 GB disk for the current LTS (it was 4 GB for 24.04)
+                MinRamGB = 6, RecommendedRamGB = 8, MinStorageGB = 25,
                 SupportsProprietaryDrivers = true,
                 GoodForGaming = true, GoodForBeginners = true,
                 DownloadUrl = "https://releases.ubuntu.com/26.04/ubuntu-26.04.1-desktop-amd64.iso",
@@ -23,8 +34,8 @@ namespace LinuxSimplify.Services
                 MinRamGB = 2, RecommendedRamGB = 4, MinStorageGB = 20,
                 SupportsProprietaryDrivers = true,
                 GoodForAdvanced = true,
-                DownloadUrl = "https://mirror.arizona.edu/fedora/linux/releases/44/Workstation/x86_64/iso/Fedora-Workstation-Live-44-1.7.x86_64.iso",
-                Sha256Url = "https://mirror.arizona.edu/fedora/linux/releases/44/Workstation/x86_64/iso/Fedora-Workstation-44-1.7-x86_64-CHECKSUM"
+                DownloadUrl = "https://download.fedoraproject.org/pub/fedora/linux/releases/44/Workstation/x86_64/iso/Fedora-Workstation-Live-44-1.7.x86_64.iso",
+                Sha256Url = "https://dl.fedoraproject.org/pub/fedora/linux/releases/44/Workstation/x86_64/iso/Fedora-Workstation-44-1.7-x86_64-CHECKSUM"
             },
             new DistroRequirements
             {
@@ -40,7 +51,7 @@ namespace LinuxSimplify.Services
                 Name = "Debian",
                 MinRamGB = 2, RecommendedRamGB = 4, MinStorageGB = 10,
                 SupportsProprietaryDrivers = true,
-                DownloadUrl = "https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/debian-13.6.0-amd64-netinst.iso",
+                DownloadUrl = "https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/debian-13.7.0-amd64-netinst.iso",
                 Sha256Url = "https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/SHA256SUMS"
             },
             new DistroRequirements
@@ -68,9 +79,11 @@ namespace LinuxSimplify.Services
                 MinRamGB = 4, RecommendedRamGB = 8, MinStorageGB = 20,
                 SupportsProprietaryDrivers = true,
                 GoodForGaming = true, GoodForBeginners = true,
-                DownloadUrl = "https://iso.pop-os.org/22.04/amd64/intel/58/pop-os_22.04_amd64_intel_58.iso",
-                NvidiaDownloadUrl = "https://iso.pop-os.org/22.04/amd64/nvidia/58/pop-os_22.04_amd64_nvidia_58.iso",
-                Sha256Url = "https://iso.pop-os.org/22.04/amd64/intel/58/SHA256SUMS"
+                // intel and nvidia builds are numbered independently
+                DownloadUrl = "https://iso.pop-os.org/24.04/amd64/intel/20/pop-os_24.04_amd64_intel_20.iso",
+                Sha256Url = "https://iso.pop-os.org/24.04/amd64/intel/20/SHA256SUMS",
+                NvidiaDownloadUrl = "https://iso.pop-os.org/24.04/amd64/nvidia/28/pop-os_24.04_amd64_nvidia_28.iso",
+                NvidiaSha256Url = "https://iso.pop-os.org/24.04/amd64/nvidia/28/SHA256SUMS"
             },
             new DistroRequirements
             {
@@ -113,26 +126,25 @@ namespace LinuxSimplify.Services
             var recommended = compatible.Where(d => d.IsRecommended).ToList();
             var others = compatible.Where(d => !d.IsRecommended).ToList();
 
-            var totalStorage = hw.StorageDevices.Sum(s => s.SizeGB);
+            var totalStorage = LargestDiskGB(hw);
 
-            recommended.Sort((a, b) =>
-            {
-                int scoreA = DistroFitScore(a.Name, hw, totalStorage);
-                int scoreB = DistroFitScore(b.Name, hw, totalStorage);
-                return scoreB.CompareTo(scoreA);
-            });
-
-            others.Sort((a, b) =>
-            {
-                int scoreA = DistroFitScore(a.Name, hw, totalStorage);
-                int scoreB = DistroFitScore(b.Name, hw, totalStorage);
-                return scoreB.CompareTo(scoreA);
-            });
+            // OrderBy is stable (List.Sort is not): distros with equal scores keep their database order
+            recommended = recommended.OrderByDescending(d => DistroFitScore(d.Name, hw, totalStorage)).ToList();
+            others = others.OrderByDescending(d => DistroFitScore(d.Name, hw, totalStorage)).ToList();
 
             var result = new List<DistroCompatibility>();
             result.AddRange(recommended);
             result.AddRange(others);
             return result;
+        }
+
+        /// <summary>
+        /// The install goes onto ONE disk, so the biggest disk is what matters (two 10 GB disks are not a 20 GB disk).
+        /// Returns 0 when no disks were detected, which callers treat as "unknown".
+        /// </summary>
+        private static double LargestDiskGB(HardwareInfo hw)
+        {
+            return hw.StorageDevices.Count > 0 ? hw.StorageDevices.Max(s => s.SizeGB) : 0;
         }
 
         private int DistroFitScore(string name, HardwareInfo hw, double totalStorage)
@@ -142,10 +154,10 @@ namespace LinuxSimplify.Services
             bool isHeavy = name == "Fedora" || name == "Zorin OS" || name == "Pop!_OS" || name == "Ubuntu";
             bool isGaming = name == "Pop!_OS" || name == "EndeavourOS" || name == "Arch Linux";
 
-            if (hw.RamGB <= 4) { if (isLight) score += 20; if (isHeavy) score -= 10; }
+            if (hw.RamGB > 0 && hw.RamGB <= 4) { if (isLight) score += 20; if (isHeavy) score -= 10; }
             else if (hw.RamGB >= 16) { if (isHeavy) score += 5; }
 
-            if (totalStorage < 64) { if (isLight) score += 15; if (isHeavy) score -= 5; }
+            if (totalStorage > 0 && totalStorage < 64) { if (isLight) score += 15; if (isHeavy) score -= 5; }
 
             if (hw.Gpus.Any(g => g.IsGaming)) { if (isGaming) score += 10; }
             if (hw.Gpus.Any(g => g.IsWorkstation)) { if (name == "Fedora" || name == "Ubuntu") score += 10; }
@@ -184,6 +196,7 @@ namespace LinuxSimplify.Services
             var notes = new List<string>();
             bool isCompatible = true;
             bool isRecommended = false;
+            string n0 = distro.Name;
 
             // ===== GPU analysis =====
             bool hasNvidia = hw.Gpus.Any(g => g.Vendor == "NVIDIA");
@@ -203,20 +216,33 @@ namespace LinuxSimplify.Services
                 notes.Add($"Your {ShortGpuName(gpuName)} needs proprietary drivers");
             }
 
-            // ===== RAM =====
-            if (hw.RamGB < distro.MinRamGB)
+            // ===== Architecture — every ISO in the database is a 64-bit x86 image =====
+            string arch = (hw.Architecture ?? "").ToLowerInvariant();
+            if (arch == "x86" || arch == "i386" || arch == "i686")
+            {
+                isCompatible = false;
+                notes.Add("32-bit CPUs can't run this 64-bit distro");
+            }
+            else if (arch == "aarch64" || arch == "arm64" || arch == "arm")
+            {
+                // Not blocking: someone on an ARM machine may well be preparing a stick for a different (x86-64) PC
+                notes.Add("This ISO is for 64-bit x86 PCs, not ARM");
+            }
+
+            // ===== RAM (0 = scan failed / unknown, don't reject everything because of that) =====
+            if (hw.RamGB > 0 && hw.RamGB < distro.MinRamGB)
             {
                 isCompatible = false;
                 notes.Add($"Needs at least {distro.MinRamGB} GB RAM");
             }
-            else if (hw.RamGB < distro.RecommendedRamGB)
+            else if (hw.RamGB > 0 && hw.RamGB < distro.RecommendedRamGB)
             {
                 notes.Add($"Works, but {distro.RecommendedRamGB} GB RAM recommended");
             }
 
             // ===== Storage =====
-            var totalStorage = hw.StorageDevices.Sum(s => s.SizeGB);
-            if (totalStorage < distro.MinStorageGB)
+            var totalStorage = LargestDiskGB(hw);
+            if (totalStorage > 0 && totalStorage < distro.MinStorageGB)
             {
                 isCompatible = false;
                 notes.Add($"Needs {distro.MinStorageGB} GB disk space");
@@ -224,9 +250,12 @@ namespace LinuxSimplify.Services
 
             // ===== Download URL =====
             string downloadUrl = distro.DownloadUrl;
+            string sha256Url = distro.Sha256Url;
             if (hasNvidia && !string.IsNullOrEmpty(distro.NvidiaDownloadUrl))
             {
                 downloadUrl = distro.NvidiaDownloadUrl;
+                // The NVIDIA ISO is a different file with its own hash — it must not be checked against the Intel edition's SHA256SUMS
+                sha256Url = !string.IsNullOrEmpty(distro.NvidiaSha256Url) ? distro.NvidiaSha256Url : "";
                 notes.Add("NVIDIA edition with drivers included");
             }
 
@@ -280,12 +309,12 @@ namespace LinuxSimplify.Services
                 if (profile == SystemProfile.Standard && meetsRec)
                 {
                     isRecommended = true;
-                    notes.Add("Easiest transition from Windows");
+                    notes.Add(windowsMigration ? "Easiest transition from Windows" : "Easiest to get started with");
                 }
                 else if (meetsRec)
                 {
                     isRecommended = true;
-                    notes.Add("Beginner-friendly, Windows-like feel");
+                    notes.Add(windowsMigration ? "Beginner-friendly, Windows-like feel" : "Beginner-friendly, familiar desktop");
                 }
                 else
                     notes.Add("Very approachable for newcomers");
@@ -356,15 +385,15 @@ namespace LinuxSimplify.Services
                 if (profile == SystemProfile.Standard && meetsRec)
                 {
                     isRecommended = true;
-                    notes.Add("Looks and feels like Windows, smooth transition");
+                    notes.Add(windowsMigration ? "Looks and feels like Windows, smooth transition" : "Polished, easy-to-use desktop");
                 }
                 else if (meetsRec)
                 {
                     isRecommended = true;
-                    notes.Add("Designed for Windows users switching to Linux");
+                    notes.Add(windowsMigration ? "Designed for Windows users switching to Linux" : "Polished, easy-to-use desktop");
                 }
                 else
-                    notes.Add("Familiar Windows-like interface");
+                    notes.Add(windowsMigration ? "Familiar Windows-like interface" : "Familiar, easy-to-use interface");
             }
             else if (n == "Debian")
             {
@@ -375,13 +404,18 @@ namespace LinuxSimplify.Services
             }
             else if (n == "Trisquel")
             {
-                if (integratedOnly && hw.Gpus.All(g => g.Vendor == "Intel"))
+                if (hw.Gpus.Count > 0 && integratedOnly && hw.Gpus.All(g => g.Vendor == "Intel"))
                     notes.Add("Your Intel GPU works great with free drivers");
                 else if (hasAmdDiscrete)
                     notes.Add("AMD GPUs have good open-source drivers");
                 else
                     notes.Add("100% free software, no proprietary drivers");
             }
+
+            // Arch's and EndeavourOS's official ISOs aren't signed for Secure Boot
+            if (isCompatible && (n0 == "Arch Linux" || n0 == "EndeavourOS") &&
+                string.Equals(hw.SecureBootStatus, "Enabled", StringComparison.OrdinalIgnoreCase))
+                notes.Add("Disable Secure Boot in firmware to boot this ISO");
 
             Finish:
             if (isCompatible && notes.Count == 0)
@@ -402,7 +436,7 @@ namespace LinuxSimplify.Services
                 Notes = string.Join("; ", notes),
                 IsRecommended = isCompatible && isRecommended,
                 DownloadUrl = downloadUrl,
-                Sha256Url = distro.Sha256Url,
+                Sha256Url = sha256Url,
                 ChecksumType = distro.ChecksumType,
                 IsSelected = false
             };

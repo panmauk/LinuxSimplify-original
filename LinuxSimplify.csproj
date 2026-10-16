@@ -9,6 +9,8 @@
     <ApplicationIcon>app.ico</ApplicationIcon>
     <Nullable>disable</Nullable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <!-- The Linux/Avalonia port lives in linux\ and has its own project; keep its sources and build output out of this one -->
+    <DefaultItemExcludes>$(DefaultItemExcludes);linux/**</DefaultItemExcludes>
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="System.Management" Version="8.0.0" />

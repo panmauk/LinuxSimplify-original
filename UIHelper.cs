@@ -183,7 +183,10 @@ namespace LinuxSimplify.UI
             canvas.Children.Add(knob);
 
             bool dragging = false; double dsx = 0, ksx = 0; bool done = false;
-            trough.Loaded += (s, e) => { shimmer.Measure(new Size(9999, 9999)); Canvas.SetLeft(shimmer, (canvas.ActualWidth - shimmer.DesiredSize.Width) / 2); StartShimmer(shimmerBrush); };
+            DispatcherTimer shimmerTimer = null;
+            trough.Loaded += (s, e) => { shimmer.Measure(new Size(9999, 9999)); Canvas.SetLeft(shimmer, (canvas.ActualWidth - shimmer.DesiredSize.Width) / 2); shimmerTimer?.Stop(); shimmerTimer = StartShimmer(shimmerBrush); };
+            // the shimmer timer used to tick forever (and keep the removed page alive) after the lock screen was left
+            trough.Unloaded += (s, e) => { shimmerTimer?.Stop(); shimmerTimer = null; };
             knob.MouseLeftButtonDown += (s, e) => { if (done) return; dragging = true; dsx = e.GetPosition(canvas).X; ksx = Canvas.GetLeft(knob); knob.CaptureMouse(); e.Handled = true; };
             knob.MouseMove += (s, e) => { if (!dragging || done) return; double mx = Math.Max(margin, Math.Min(ksx + e.GetPosition(canvas).X - dsx, canvas.ActualWidth - knobSz - margin)); Canvas.SetLeft(knob, mx); shimmer.Opacity = Math.Max(0, 1 - (mx - margin) / (canvas.ActualWidth - knobSz - 2 * margin) * 1.5); };
             knob.MouseLeftButtonUp += (s, e) =>
@@ -196,7 +199,7 @@ namespace LinuxSimplify.UI
             return trough;
         }
 
-        static void StartShimmer(LinearGradientBrush b) { var t = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(40) }; double p = -0.5; t.Tick += (s, e) => { p += 0.008; if (p > 1.5) p = -0.5; b.GradientStops[0].Offset = p - 0.3; b.GradientStops[1].Offset = p; b.GradientStops[2].Offset = p + 0.1; b.GradientStops[3].Offset = p + 0.4; }; t.Start(); }
+        static DispatcherTimer StartShimmer(LinearGradientBrush b) { var t = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(40) }; double p = -0.5; t.Tick += (s, e) => { p += 0.008; if (p > 1.5) p = -0.5; b.GradientStops[0].Offset = p - 0.3; b.GradientStops[1].Offset = p; b.GradientStops[2].Offset = p + 0.1; b.GradientStops[3].Offset = p + 0.4; }; t.Start(); return t; }
         static void SmoothCanvasLeft(UIElement el, double from, double to, int ms) { var t = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(16) }; double s = Environment.TickCount; t.Tick += (_, __) => { double p2 = Math.Min(1, (Environment.TickCount - s) / ms); p2 = 1 - (1 - p2) * (1 - p2); Canvas.SetLeft(el, from + (to - from) * p2); if (p2 >= 1) t.Stop(); }; t.Start(); }
 
         // =============================================================
@@ -311,6 +314,7 @@ namespace LinuxSimplify.UI
 
             void GoTo(int idx, bool animate)
             {
+                if (distros.Count == 0) return; // every distro was filtered out: nothing to pick (distros[0] would throw)
                 idx = Math.Max(0, Math.Min(idx, distros.Count - 1));
                 if (idx == sel_idx && Math.Abs(transform.Y - (-idx * RH)) < 1) return;
                 sel_idx = idx;

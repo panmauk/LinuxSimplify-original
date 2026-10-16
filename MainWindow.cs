@@ -74,40 +74,31 @@ namespace LinuxSimplify
 
         private async Task ScanInBackground()
         {
-            // Run hardware scan and URL resolution in parallel
-            var hwTask = hardwareScanner.ScanHardwareAsync();
-            var urlTask = urlResolver.ResolveAllAsync();
-
-            currentHardware = await hwTask;
-            distroResults = compatibilityAnalyzer.AnalyzeCompatibility(currentHardware);
-
-            // Apply resolved URLs (replace hardcoded with live ones)
+            // scanComplete MUST end up true whatever happens: the lock screen's slider waits on it, and
+            // an exception here (the task is fire-and-forget) used to leave the app waiting forever.
             try
             {
-                var resolved = await urlTask;
-                foreach (var d in distroResults)
-                {
-                    if (resolved.TryGetValue(d.Name, out var r) && r.Resolved)
-                    {
-                        d.DownloadUrl = r.DownloadUrl;
-                        if (!string.IsNullOrEmpty(r.Sha256Url))
-                            d.Sha256Url = r.Sha256Url;
-                        if (!string.IsNullOrEmpty(r.ChecksumType))
-                            d.ChecksumType = r.ChecksumType;
-                        if (!string.IsNullOrEmpty(r.NvidiaDownloadUrl))
-                        {
-                            bool hasNv = currentHardware.Gpus.Any(g => g.Vendor == "NVIDIA");
-                            if (hasNv) d.DownloadUrl = r.NvidiaDownloadUrl;
-                        }
-                    }
-                }
-            }
-            catch { /* URL resolution failed, use hardcoded fallbacks */ }
+                // Run hardware scan and URL resolution in parallel
+                var hwTask = hardwareScanner.ScanHardwareAsync();
+                var urlTask = urlResolver.ResolveAllAsync();
 
-            selectedDistro = distroResults.FirstOrDefault(d => d.IsRecommended)
-                          ?? distroResults.FirstOrDefault();
-            if (selectedDistro != null) selectedDistro.IsSelected = true;
-            scanComplete = true;
+                currentHardware = await hwTask;
+                distroResults = compatibilityAnalyzer.AnalyzeCompatibility(currentHardware);
+
+                // Apply resolved URLs (replace hardcoded with live ones)
+                try
+                {
+                    var resolved = await urlTask;
+                    DistroUrlResolver.ApplyResolved(distroResults, resolved, currentHardware.Gpus.Any(g => g.Vendor == "NVIDIA"));
+                }
+                catch { /* URL resolution failed, use hardcoded fallbacks */ }
+
+                selectedDistro = distroResults.FirstOrDefault(d => d.IsRecommended)
+                              ?? distroResults.FirstOrDefault();
+                if (selectedDistro != null) selectedDistro.IsSelected = true;
+            }
+            catch { /* leave whatever we have; pages cope with null/empty results */ }
+            finally { scanComplete = true; }
         }
 
         private void OnWindowClosing(object sender, CancelEventArgs e)
@@ -129,26 +120,32 @@ namespace LinuxSimplify
             }
         }
 
+        // One shared client — creating (and disposing) a client per check leaks sockets in TIME_WAIT
+        private static readonly System.Net.Http.HttpClient connectivityClient = new System.Net.Http.HttpClient { Timeout = TimeSpan.FromSeconds(5) };
+
         private async Task<bool> CheckInternetAsync()
         {
-            try
+            foreach (var url in new[] { "https://www.google.com/generate_204", "https://captive.apple.com" })
             {
-                using (var http = new System.Net.Http.HttpClient { Timeout = TimeSpan.FromSeconds(5) })
+                try
                 {
-                    var resp = await http.GetAsync("https://www.google.com/generate_204");
-                    return resp.IsSuccessStatusCode;
+                    using (var resp = await connectivityClient.GetAsync(url))
+                        if (resp.IsSuccessStatusCode) return true;
                 }
+                catch { }
             }
-            catch { }
-            try
+            return false;
+        }
+
+        /// <summary>Awaits a fire-and-forget page task and shows any exception instead of silently losing it.</summary>
+        private async Task RunGuarded(Task task)
+        {
+            try { await task; }
+            catch (Exception ex)
             {
-                using (var http = new System.Net.Http.HttpClient { Timeout = TimeSpan.FromSeconds(5) })
-                {
-                    var resp = await http.GetAsync("https://captive.apple.com");
-                    return resp.IsSuccessStatusCode;
-                }
+                isDownloading = false; isFlashing = false;
+                MessageBox.Show(ex.Message, "LinuxSimplify", MessageBoxButton.OK, MessageBoxImage.Error);
             }
-            catch { return false; }
         }
 
         private void SetupPage(string title = "LinuxSimplify")
@@ -198,9 +195,14 @@ namespace LinuxSimplify
             };
             var slider = UIHelper.CreateSlideToUnlock("slide to scan", async () =>
             {
-                SoundHelper.PlayUnlock();
-                while (!scanComplete) await Task.Delay(50);
-                ShowSpecsPage();
+                // async void under the hood (Action): an escaping exception would crash the app
+                try
+                {
+                    SoundHelper.PlayUnlock();
+                    while (!scanComplete) await Task.Delay(50);
+                    ShowSpecsPage();
+                }
+                catch (Exception ex) { MessageBox.Show(ex.Message, "LinuxSimplify", MessageBoxButton.OK, MessageBoxImage.Error); }
             });
             sliderContainer.Children.Add(slider);
             lockScreen.Children.Add(sliderContainer);
@@ -299,8 +301,8 @@ namespace LinuxSimplify
             var dl = UIHelper.CreateGreenActionButton("Download ISO");
             dl.Click += (s, e) =>
             {
-                if (selectedDistro == null) return;
-                _ = DoDownloadAsync();
+                if (selectedDistro == null || isDownloading) return;
+                _ = RunGuarded(DoDownloadAsync());
             };
             btnP.Children.Add(dl);
             mainContent.Children.Add(btnP);
@@ -350,6 +352,7 @@ namespace LinuxSimplify
 
             string fn = $"{selectedDistro.Name.Replace(" ", "_")}.iso";
             downloadedIsoPath = Path.Combine(isoFolderPath, fn);
+            var distro = selectedDistro; // keep a stable reference for the whole download
 
             var al = new TextBlock
             {
@@ -378,72 +381,61 @@ namespace LinuxSimplify
 
             try
             {
-                var prog = new Progress<DownloadState>(s => Dispatcher.Invoke(() =>
+                // Progress<T> invokes this on the UI thread already (it captures the SynchronizationContext)
+                var prog = new Progress<DownloadState>(s =>
                 {
                     currentDownloadState = s; pb.Value = s.Percentage;
                     if (!string.IsNullOrEmpty(s.ErrorMessage)) et.Text = s.ErrorMessage;
-                }));
+                });
 
-                bool ok = await isoDownloader.DownloadIsoAsync(selectedDistro.DownloadUrl, downloadedIsoPath, prog, downloadCts.Token);
-                if (!ok) { Dispatcher.Invoke(() => { al.Text = "Download failed"; }); isDownloading = false; AddRetry(); return; }
+                bool ok = await isoDownloader.DownloadIsoAsync(distro.DownloadUrl, downloadedIsoPath, prog, downloadCts.Token);
+                if (!ok) { al.Text = "Download failed"; isDownloading = false; AddRetry(); return; }
 
-                Dispatcher.Invoke(() => { al.Text = "Verifying\u2026"; pb.IsIndeterminate = true; });
+                al.Text = "Verifying\u2026"; pb.IsIndeterminate = true;
 
-                bool verified = false;
-                bool checksumAvailable = false;
-
-                if (!string.IsNullOrEmpty(selectedDistro.Sha256Url))
-                {
-                    checksumAvailable = true;
-                    var cf = await isoDownloader.DownloadChecksumFileAsync(selectedDistro.Sha256Url);
-                    var sp = new Progress<string>(_ => { });
-                    string algo = selectedDistro.ChecksumType ?? "sha256";
-                    var h = await isoDownloader.ComputeChecksumAsync(downloadedIsoPath, algo, sp);
-                    if (cf != null && h != null)
-                    {
-                        verified = isoDownloader.VerifySha256(h, cf, downloadedIsoPath);
-                    }
-                }
+                // Mismatch = the file is corrupt or tampered with. "Unavailable" = nothing to compare against
+                // (no checksum published / couldn't be fetched) - that is reported as such, not as a failure.
+                var status = await isoDownloader.VerifyIsoAsync(downloadedIsoPath, distro.DownloadUrl,
+                    distro.Sha256Url, distro.ChecksumType, distro.ExpectedHash);
 
                 isDownloading = false;
+                pb.IsIndeterminate = false;
+                pb.Value = 100;
 
-                Dispatcher.Invoke(() =>
+                if (status == ChecksumStatus.Mismatch)
                 {
-                    pb.IsIndeterminate = false;
-                    pb.Value = 100;
-                    al.Text = "Download complete";
+                    // Never offer a file that failed its checksum for flashing
+                    try { File.Delete(downloadedIsoPath); } catch { }
+                    al.Text = "Download is corrupted";
+                    verifyText.Text = "\u26A0 The download doesn't match its checksum and was deleted";
+                    verifyText.Foreground = new SolidColorBrush(Color.FromRgb(200, 60, 60));
+                    verifyText.FontWeight = FontWeights.SemiBold;
+                    AddRetry();
+                    return;
+                }
 
-                    if (checksumAvailable)
-                    {
-                        if (verified)
-                        {
-                            verifyText.Text = "\u2713 Download is safe";
-                            verifyText.Foreground = new SolidColorBrush(Color.FromRgb(80, 150, 50));
-                            verifyText.FontWeight = FontWeights.SemiBold;
-                        }
-                        else
-                        {
-                            verifyText.Text = "\u26A0 Download might not be safe";
-                            verifyText.Foreground = new SolidColorBrush(Color.FromRgb(200, 150, 30));
-                            verifyText.FontWeight = FontWeights.SemiBold;
-                        }
-                    }
-                    else
-                    {
-                        verifyText.Text = "Could not verify download";
-                        verifyText.Foreground = new SolidColorBrush(Color.FromRgb(140, 145, 155));
-                    }
+                al.Text = "Download complete";
+                if (status == ChecksumStatus.Verified)
+                {
+                    verifyText.Text = "\u2713 Download is safe";
+                    verifyText.Foreground = new SolidColorBrush(Color.FromRgb(80, 150, 50));
+                    verifyText.FontWeight = FontWeights.SemiBold;
+                }
+                else
+                {
+                    verifyText.Text = "Could not verify download";
+                    verifyText.Foreground = new SolidColorBrush(Color.FromRgb(140, 145, 155));
+                }
 
-                    // Next button — user decides when to proceed
-                    var btnP = new StackPanel { Margin = new Thickness(0, 20, 0, 20) };
-                    var next = UIHelper.CreateDarkNextButton("Next");
-                    next.Click += (s, e) => ShowFlashPrompt();
-                    btnP.Children.Add(next);
-                    mainContent.Children.Add(btnP);
-                });
+                // Next button - user decides when to proceed
+                var btnP = new StackPanel { Margin = new Thickness(0, 20, 0, 20) };
+                var next = UIHelper.CreateDarkNextButton("Next");
+                next.Click += (s, e) => ShowFlashPrompt();
+                btnP.Children.Add(next);
+                mainContent.Children.Add(btnP);
             }
-            catch (OperationCanceledException) { isDownloading = false; Dispatcher.Invoke(() => al.Text = "Cancelled"); AddRetry(); }
-            catch (Exception ex) { isDownloading = false; Dispatcher.Invoke(() => { al.Text = "Download failed"; et.Text = ex.Message; }); AddRetry(); }
+            catch (OperationCanceledException) { isDownloading = false; al.Text = "Cancelled"; AddRetry(); }
+            catch (Exception ex) { isDownloading = false; al.Text = "Download failed"; et.Text = ex.Message; AddRetry(); }
         }
 
         private void AddRetry()
@@ -520,7 +512,7 @@ namespace LinuxSimplify
             {
                 if (selectedUsbDrive == null) return;
                 StopUsbPolling();
-                _ = DoFlashAsync();
+                _ = RunGuarded(DoFlashAsync());
             };
             bp.Children.Add(usbNextButton);
             mainContent.Children.Add(bp);
@@ -536,7 +528,7 @@ namespace LinuxSimplify
             usbPollTimer.Start();
         }
 
-        private bool usbRefreshing = false;
+        private volatile bool usbRefreshing = false;
         private void RefreshUsbList()
         {
             if (usbRefreshing) return; // Skip if previous refresh still running
@@ -547,19 +539,24 @@ namespace LinuxSimplify
                 try
                 {
                     var drives = hardwareScanner.GetUsbDrives();
-                    Dispatcher.Invoke(() =>
+                    Dispatcher.BeginInvoke(new Action(() =>
                     {
                         try
                         {
-                            // Check if list changed (compare by disk number)
-                            var currentIds = drives.Select(d => d.DiskNumber).OrderBy(x => x).ToList();
-                            var lastIds = lastKnownDrives.Select(d => d.DiskNumber).OrderBy(x => x).ToList();
+                            // The user may have moved on (Next / back) while the scan ran. Touching state then would
+                            // null out selectedUsbDrive right before DoFlashAsync reads it, or edit a page that is gone.
+                            if (usbPollTimer == null || usbListPanel == null) return;
+
+                            // Check if list changed (identity = disk number + device id + size, so swapping one stick for another is noticed)
+                            Func<UsbDrive, string> key = d => $"{d.DiskNumber}|{d.DeviceId}|{d.SizeBytes}|{d.Name}";
+                            var currentIds = drives.Select(key).OrderBy(x => x).ToList();
+                            var lastIds = lastKnownDrives.Select(key).OrderBy(x => x).ToList();
                             if (currentIds.SequenceEqual(lastIds)) return; // No change
 
                             lastKnownDrives = drives;
 
                             // Remember current selection
-                            int selectedDisk = selectedUsbDrive?.DiskNumber ?? -1;
+                            string selectedKey = selectedUsbDrive != null ? key(selectedUsbDrive) : null;
                             selectedUsbDrive = null;
 
                             usbListPanel.Children.Clear();
@@ -580,7 +577,7 @@ namespace LinuxSimplify
                                 var drive = d;
                                 r.Checked += (s, e) => { selectedUsbDrive = drive; usbNextButton.IsEnabled = true; };
 
-                                if (d.DiskNumber == selectedDisk)
+                                if (key(d) == selectedKey)
                                 {
                                     r.IsChecked = true;
                                     selectedUsbDrive = d;
@@ -596,7 +593,7 @@ namespace LinuxSimplify
                             usbNextButton.IsEnabled = selectedUsbDrive != null;
                         }
                         catch { }
-                    });
+                    }));
                 }
                 catch { }
                 finally { usbRefreshing = false; }
@@ -634,18 +631,38 @@ namespace LinuxSimplify
             var et = UIHelper.CreateStatusText(""); et.Foreground = new SolidColorBrush(Color.FromRgb(200, 60, 60)); et.FontWeight = FontWeights.SemiBold; ps.Children.Add(et);
             mainContent.Children.Add(UIHelper.CreateGroupedSection(ps));
 
-            var fp = new Progress<string>(msg => Dispatcher.Invoke(() =>
+            var fp = new Progress<string>(msg =>
             {
                 if (msg.StartsWith("Flashing..."))
                 {
                     var p = msg.Replace("Flashing... ", "").Replace("%", "").Trim();
+                    if (int.TryParse(p, out int v)) { al.Text = "Flashing to USB\u2026"; pb.Value = v; }
+                }
+                else if (msg.StartsWith("Verifying..."))
+                {
+                    var p = msg.Replace("Verifying... ", "").Replace("%", "").Trim();
+                    al.Text = "Verifying USB\u2026";
                     if (int.TryParse(p, out int v)) pb.Value = v;
                 }
-                else if (msg.Contains("ERROR")) { al.Text = "Flash failed"; et.Text = msg.Replace("ERROR: ", ""); }
-            }));
+                else if (msg.StartsWith("ERROR")) { al.Text = "Flash failed"; et.Text = msg.Replace("ERROR: ", ""); }
+            });
+
+            var target = selectedUsbDrive;
+            if (target == null)
+            {
+                isFlashing = false;
+                al.Text = "Flash failed";
+                et.Text = "No USB drive selected";
+                var bp0 = new StackPanel { Margin = new Thickness(0, 14, 0, 15) };
+                var b0 = UIHelper.CreateDarkNextButton("Try Again");
+                b0.Click += (s2, e2) => ShowFlashPrompt();
+                bp0.Children.Add(b0);
+                mainContent.Children.Add(bp0);
+                return;
+            }
 
             bool ok = await usbFlasher.FlashIsoToUsbAsync(
-                downloadedIsoPath, selectedUsbDrive.DiskNumber,
+                downloadedIsoPath, target,
                 currentHardware?.BootMode == "UEFI", fp);
 
             if (ok)
@@ -788,9 +805,10 @@ namespace LinuxSimplify
                         // If recycle bin fails, just delete
                         try { File.Delete(f); } catch { }
                     }
+                    if (File.Exists(f)) { try { File.Delete(f); } catch { } }
                 }
                 // Also clean partial downloads
-                var partials = Directory.GetFiles(isoFolderPath, "*.iso.tmp");
+                var partials = Directory.GetFiles(isoFolderPath, "*.iso.part");
                 foreach (var f in partials)
                 {
                     try { File.Delete(f); } catch { }
@@ -829,7 +847,11 @@ namespace LinuxSimplify
                 pFrom = filePath + '\0' + '\0',  // Double-null terminated
                 fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT
             };
-            SHFileOperation(ref fs);
+            // SHFileOperation reports failure through its return value, not by throwing. Ignoring it meant the
+            // ISO silently stayed on disk, so surface it and let the caller fall back to a plain delete.
+            int rc = SHFileOperation(ref fs);
+            if (rc != 0 || fs.fAnyOperationsAborted)
+                throw new IOException($"Recycle bin operation failed ({rc})");
         }
     }
 }

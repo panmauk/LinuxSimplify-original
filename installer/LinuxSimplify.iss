@@ -2,7 +2,7 @@
 ; Build with: installer\build-installer.bat  (or run ISCC.exe on this file after publishing)
 
 #define MyAppName "LinuxSimplify"
-#define MyAppVersion "0.1.0"
+#define MyAppVersion "1.0.0"
 #define MyAppPublisher "panmauk"
 #define MyAppURL "https://github.com/panmauk/LinuxSimplify-original"
 #define MyAppExeName "LinuxSimplify.exe"
