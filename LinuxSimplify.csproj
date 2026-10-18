@@ -12,6 +12,16 @@
     <!-- The Linux/Avalonia port lives in linux\ and has its own project; keep its sources and build output out of this one -->
     <DefaultItemExcludes>$(DefaultItemExcludes);linux/**</DefaultItemExcludes>
   </PropertyGroup>
+  <!-- Release builds: no debug symbols and deterministic, path-mapped compilation, so the published
+       exe never contains source/PDB paths from the build machine (user names, folders). -->
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+    <Deterministic>true</Deterministic>
+    <ContinuousIntegrationBuild>true</ContinuousIntegrationBuild>
+    <PathMap>$(MSBuildProjectDirectory)=/src</PathMap>
+  </PropertyGroup>
+
   <ItemGroup>
     <PackageReference Include="System.Management" Version="8.0.0" />
   </ItemGroup>
