@@ -23,7 +23,6 @@ namespace LinuxSimplify
         private readonly HardwareScanner hardwareScanner;
         private readonly CompatibilityAnalyzer compatibilityAnalyzer;
         private readonly IsoDownloader isoDownloader;
-        private readonly UsbFlasher usbFlasher;
 
         private readonly DistroUrlResolver urlResolver;
 
@@ -48,7 +47,6 @@ namespace LinuxSimplify
             hardwareScanner = new HardwareScanner();
             compatibilityAnalyzer = new CompatibilityAnalyzer();
             isoDownloader = new IsoDownloader();
-            usbFlasher = new UsbFlasher();
             urlResolver = new DistroUrlResolver();
             distroResults = new List<DistroCompatibility>();
             currentDownloadState = new DownloadState();
@@ -385,7 +383,7 @@ namespace LinuxSimplify
                 var prog = new Progress<DownloadState>(s =>
                 {
                     currentDownloadState = s; pb.Value = s.Percentage;
-                    if (!string.IsNullOrEmpty(s.ErrorMessage)) et.Text = s.ErrorMessage;
+                    et.Text = s.ErrorMessage ?? ""; // cleared again once a retry recovers
                 });
 
                 bool ok = await isoDownloader.DownloadIsoAsync(distro.DownloadUrl, downloadedIsoPath, prog, downloadCts.Token);
@@ -395,8 +393,10 @@ namespace LinuxSimplify
 
                 // Mismatch = the file is corrupt or tampered with. "Unavailable" = nothing to compare against
                 // (no checksum published / couldn't be fetched) - that is reported as such, not as a failure.
-                var status = await isoDownloader.VerifyIsoAsync(downloadedIsoPath, distro.DownloadUrl,
+                // (also checks the distro's OpenPGP signature where one is published)
+                var verification = await isoDownloader.VerifyIsoAsync(downloadedIsoPath, distro.Name, distro.DownloadUrl,
                     distro.Sha256Url, distro.ChecksumType, distro.ExpectedHash);
+                var status = verification.Status;
 
                 isDownloading = false;
                 pb.IsIndeterminate = false;
@@ -404,10 +404,10 @@ namespace LinuxSimplify
 
                 if (status == ChecksumStatus.Mismatch)
                 {
-                    // Never offer a file that failed its checksum for flashing
+                    // Never offer a file that failed its checksum or signature for flashing
                     try { File.Delete(downloadedIsoPath); } catch { }
                     al.Text = "Download is corrupted";
-                    verifyText.Text = "\u26A0 The download doesn't match its checksum and was deleted";
+                    verifyText.Text = verification.Message;
                     verifyText.Foreground = new SolidColorBrush(Color.FromRgb(200, 60, 60));
                     verifyText.FontWeight = FontWeights.SemiBold;
                     AddRetry();
@@ -415,15 +415,14 @@ namespace LinuxSimplify
                 }
 
                 al.Text = "Download complete";
+                verifyText.Text = verification.Message;
                 if (status == ChecksumStatus.Verified)
                 {
-                    verifyText.Text = "\u2713 Download is safe";
                     verifyText.Foreground = new SolidColorBrush(Color.FromRgb(80, 150, 50));
                     verifyText.FontWeight = FontWeights.SemiBold;
                 }
                 else
                 {
-                    verifyText.Text = "Could not verify download";
                     verifyText.Foreground = new SolidColorBrush(Color.FromRgb(140, 145, 155));
                 }
 
@@ -661,7 +660,8 @@ namespace LinuxSimplify
                 return;
             }
 
-            bool ok = await usbFlasher.FlashIsoToUsbAsync(
+            // The app runs as a normal user; this asks for administrator rights (UAC) just for the write
+            bool ok = await ElevatedFlash.FlashAsync(
                 downloadedIsoPath, target,
                 currentHardware?.BootMode == "UEFI", fp);
 

@@ -2,7 +2,7 @@
 ; Build with: installer\build-installer.bat  (or run ISCC.exe on this file after publishing)
 
 #define MyAppName "LinuxSimplify"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "1.0.1"
 #define MyAppPublisher "panmauk"
 #define MyAppURL "https://github.com/panmauk/LinuxSimplify-original"
 #define MyAppExeName "LinuxSimplify.exe"
@@ -26,8 +26,8 @@ SetupIconFile=..\app.ico
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
-; The app itself is manifested to require admin (needed for raw USB flashing),
-; so the installer requires it too rather than silently failing at first launch.
+; Installs for all users under Program Files, which needs admin. (The app itself runs as a normal
+; user and asks for admin rights only when it writes the USB drive.)
 PrivilegesRequired=admin
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible

@@ -6,6 +6,7 @@ using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Security.Cryptography;
+using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
@@ -16,8 +17,29 @@ namespace LinuxSimplify.Services
     public enum ChecksumStatus
     {
         Verified,     // checksum found and matches
-        Mismatch,     // checksum found and does NOT match — file is corrupt or tampered with
+        Mismatch,     // checksum (or signature) does NOT match — file is corrupt or tampered with
         Unavailable   // nothing to compare against (no checksum published / could not fetch / no entry for this file)
+    }
+
+    /// <summary>Result of verifying a downloaded ISO: checksum status plus whether a distro signature vouched for it.</summary>
+    public sealed class IsoVerification
+    {
+        public ChecksumStatus Status = ChecksumStatus.Unavailable;
+        public SignatureResult Signature = SignatureResult.Unavailable;
+        /// <summary>Who signed it (e.g. "Ubuntu") when <see cref="Signature"/> is Valid.</summary>
+        public string Signer = "";
+        /// <summary>True when the file was rejected because its signature was invalid (not just a checksum mismatch).</summary>
+        public bool BadSignature => Signature == SignatureResult.Invalid;
+        public bool Signed => Status == ChecksumStatus.Verified && Signature == SignatureResult.Valid;
+
+        /// <summary>Short status line for the UI (same wording on Windows and Linux).</summary>
+        public string Message =>
+            Status == ChecksumStatus.Mismatch
+                ? (BadSignature ? "⚠ The download's signature is not valid, so it was deleted"
+                                : "⚠ The download doesn't match its checksum and was deleted")
+            : Signed ? $"✓ Download is safe (signed by {Signer})"
+            : Status == ChecksumStatus.Verified ? "✓ Checksum verified"
+            : "Could not verify download";
     }
 
     public class IsoDownloader
@@ -122,9 +144,16 @@ namespace LinuxSimplify.Services
                                 continue;
                             }
 
-                            // 206 = server honoured the Range; anything else means "here's the whole file"
-                            bool resumed = response.StatusCode == HttpStatusCode.PartialContent
-                                           && response.Content.Headers.ContentRange?.From == existing;
+                            // 206 = server honoured the Range; 200 = "here's the whole file"
+                            bool partial = response.StatusCode == HttpStatusCode.PartialContent;
+                            bool resumed = partial && response.Content.Headers.ContentRange?.From == existing;
+                            if (partial && !resumed)
+                            {
+                                // A partial answer for some other offset: neither a resume nor the whole file.
+                                // (It used to be saved as if it were the whole file and passed the length check.)
+                                TryDelete(partPath);
+                                throw new IOException("The server sent an unexpected part of the file");
+                            }
                             if (!resumed) existing = 0;
 
                             // With a transfer-encoding like gzip the announced length is the compressed size — can't be compared with bytes read
@@ -147,6 +176,7 @@ namespace LinuxSimplify.Services
 
                             state.TotalBytes = total;
                             state.CurrentAction = "Downloading...";
+                            state.ErrorMessage = null; // connected again: an earlier retry's error no longer applies
                             state.LastSuccessfulAction = resumed ? "Resumed" : "Connected";
                             Report();
 
@@ -284,17 +314,33 @@ namespace LinuxSimplify.Services
         /// <summary>Downloads a (small) checksum file. Returns null if it can't be fetched after a few tries.</summary>
         public async Task<string> DownloadChecksumFileAsync(string url)
         {
+            byte[] b = await DownloadSmallFileAsync(url);
+            return b == null ? null : Encoding.UTF8.GetString(b);
+        }
+
+        /// <summary>
+        /// Downloads a small file (checksum list, signature) as raw bytes — signatures are over the exact bytes.
+        /// Rejects HTML answers (captcha / challenge / error pages) and anything over 4 MB. Null on failure.
+        /// </summary>
+        public async Task<byte[]> DownloadSmallFileAsync(string url)
+        {
+            if (string.IsNullOrWhiteSpace(url)) return null;
+            const int MaxBytes = 4 * 1024 * 1024;
             for (int i = 0; i < 3; i++)
             {
                 try
                 {
                     using (var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30)))
-                    using (var resp = await httpClient.GetAsync(url, cts.Token))
+                    using (var resp = await httpClient.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, cts.Token))
                     {
-                        // A checksum file is plain text. An HTML answer is a captcha / challenge / error page, not data.
+                        if (resp.StatusCode == HttpStatusCode.NotFound) return null; // not published: don't retry
                         string type = resp.Content.Headers.ContentType?.MediaType ?? "";
-                        if (resp.IsSuccessStatusCode && !type.Equals("text/html", StringComparison.OrdinalIgnoreCase))
-                            return await resp.Content.ReadAsStringAsync();
+                        if (resp.IsSuccessStatusCode && !type.Equals("text/html", StringComparison.OrdinalIgnoreCase)
+                            && (resp.Content.Headers.ContentLength ?? 0) <= MaxBytes)
+                        {
+                            byte[] data = await resp.Content.ReadAsByteArrayAsync(cts.Token);
+                            if (data.Length <= MaxBytes) return data;
+                        }
                     }
                 }
                 catch { }
@@ -334,26 +380,89 @@ namespace LinuxSimplify.Services
         /// checksum file at <paramref name="checksumUrl"/>. The file name used to look up the entry is the one in
         /// <paramref name="downloadUrl"/>, not the local file name.
         /// </summary>
-        public async Task<ChecksumStatus> VerifyIsoAsync(string isoPath, string downloadUrl, string checksumUrl, string checksumType, string expectedHash)
+        public async Task<IsoVerification> VerifyIsoAsync(string isoPath, string distroName, string downloadUrl, string checksumUrl, string checksumType, string expectedHash)
         {
             string algo = string.IsNullOrEmpty(checksumType) ? "sha256" : checksumType;
-            string expected = null;
+            var spec = SignatureVerifier.For(distroName, downloadUrl, checksumUrl);
+            var result = new IsoVerification { Signer = spec.Signer };
+            string fileName = RemoteFileName(downloadUrl);
 
+            // 1. Checksum list, and its signature when the distro signs it
+            string listed = null;
+            if (!string.IsNullOrWhiteSpace(checksumUrl))
+            {
+                byte[] sums = await DownloadSmallFileAsync(checksumUrl);
+                if (sums != null)
+                {
+                    string sumsText = Encoding.UTF8.GetString(sums);
+                    if (spec.Kind == SignatureKind.ClearSignedChecksumFile)
+                    {
+                        string signedText = null;
+                        result.Signature = await Task.Run(() => SignatureVerifier.VerifyClearSigned(sums, spec.KeyFile, out signedText));
+                        // Only the signed part may be used: text outside the signature is not vouched for
+                        if (result.Signature == SignatureResult.Valid) sumsText = signedText;
+                    }
+                    else if (spec.Kind == SignatureKind.DetachedOverChecksumFile)
+                    {
+                        byte[] sig = await DownloadSmallFileAsync(spec.SignatureUrl);
+                        result.Signature = sig == null ? SignatureResult.Unavailable
+                            : await Task.Run(() => SignatureVerifier.VerifyDetached(sig, new MemoryStream(sums), spec.KeyFile));
+                    }
+                    if (result.Signature == SignatureResult.Invalid)
+                    {
+                        // The checksum list itself was tampered with: don't trust any hash in it
+                        result.Status = ChecksumStatus.Mismatch;
+                        return result;
+                    }
+                    listed = FindExpectedHash(sumsText, fileName, algo);
+                    // A valid signature over a list without this file vouches for nothing here
+                    if (listed == null && spec.Kind != SignatureKind.DetachedOverIso) result.Signature = SignatureResult.Unavailable;
+                }
+            }
+
+            // 2. Hash published directly by the source (Pop!_OS API). With a signed list both must agree.
+            string expected = listed;
             if (!string.IsNullOrWhiteSpace(expectedHash))
             {
-                expected = expectedHash.Trim().ToLowerInvariant();
+                string direct = expectedHash.Trim().ToLowerInvariant();
+                if (listed != null && result.Signature == SignatureResult.Valid && listed != direct)
+                {
+                    result.Status = ChecksumStatus.Mismatch;
+                    return result;
+                }
+                if (listed == null || result.Signature != SignatureResult.Valid) expected = direct;
             }
-            else if (!string.IsNullOrWhiteSpace(checksumUrl))
-            {
-                string content = await DownloadChecksumFileAsync(checksumUrl);
-                if (content == null) return ChecksumStatus.Unavailable;
-                expected = FindExpectedHash(content, RemoteFileName(downloadUrl), algo);
-            }
-            if (string.IsNullOrEmpty(expected)) return ChecksumStatus.Unavailable;
 
-            string actual = await ComputeChecksumAsync(isoPath, algo, null);
-            if (actual == null) return ChecksumStatus.Unavailable;
-            return string.Equals(actual, expected, StringComparison.OrdinalIgnoreCase) ? ChecksumStatus.Verified : ChecksumStatus.Mismatch;
+            // 3. Hash of the file itself
+            if (!string.IsNullOrEmpty(expected))
+            {
+                string actual = await ComputeChecksumAsync(isoPath, algo, null);
+                if (actual == null) { result.Status = ChecksumStatus.Unavailable; return result; }
+                if (!string.Equals(actual, expected, StringComparison.OrdinalIgnoreCase))
+                {
+                    result.Status = ChecksumStatus.Mismatch;
+                    return result;
+                }
+                result.Status = ChecksumStatus.Verified;
+            }
+
+            // 4. Distros that sign the ISO itself (Arch, EndeavourOS)
+            if (spec.Kind == SignatureKind.DetachedOverIso)
+            {
+                byte[] sig = await DownloadSmallFileAsync(spec.SignatureUrl);
+                if (sig != null)
+                {
+                    result.Signature = await Task.Run(() =>
+                    {
+                        using (var fs = new FileStream(isoPath, FileMode.Open, FileAccess.Read, FileShare.Read, BufferSize))
+                            return SignatureVerifier.VerifyDetached(sig, fs, spec.KeyFile);
+                    });
+                    if (result.Signature == SignatureResult.Invalid) { result.Status = ChecksumStatus.Mismatch; return result; }
+                    if (result.Signature == SignatureResult.Valid && result.Status == ChecksumStatus.Unavailable)
+                        result.Status = ChecksumStatus.Verified; // the signature alone proves the file
+                }
+            }
+            return result;
         }
 
         /// <summary>File name part of a URL, URL-decoded ("https://x/y/a%20b.iso" -> "a b.iso").</summary>

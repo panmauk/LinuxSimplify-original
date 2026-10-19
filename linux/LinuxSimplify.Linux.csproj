@@ -6,7 +6,7 @@
     <RootNamespace>LinuxSimplify</RootNamespace>
     <Nullable>disable</Nullable>
     <ImplicitUsings>disable</ImplicitUsings>
-    <Version>1.0.0</Version>
+    <Version>1.0.1</Version>
     <!-- No libicu dependency on the target machine (self-contained builds otherwise need it) -->
     <InvariantGlobalization>true</InvariantGlobalization>
     <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
@@ -21,6 +21,14 @@
     <Compile Include="..\DistroUrlResolver.cs" Link="Shared\DistroUrlResolver.cs" />
     <Compile Include="..\IsoDownloader.cs" Link="Shared\IsoDownloader.cs" />
     <Compile Include="..\HardwareClassifier.cs" Link="Shared\HardwareClassifier.cs" />
+    <Compile Include="..\SignatureVerifier.cs" Link="Shared\SignatureVerifier.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- OpenPGP signature checks of distro downloads -->
+    <PackageReference Include="BouncyCastle.Cryptography" Version="2.7.0" />
+    <!-- Pinned distro signing keys (see SignatureVerifier.cs for where each fingerprint was confirmed) -->
+    <EmbeddedResource Include="..\keys\*.asc" LogicalName="keys.%(Filename).asc" />
   </ItemGroup>
 
   <ItemGroup>

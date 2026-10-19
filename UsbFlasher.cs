@@ -148,8 +148,13 @@ namespace LinuxSimplify.Services
                     //  This is the same approach Rufus uses.
                     // ==========================================================
                     statusReporter?.Report("Preparing USB drive...");
-                    RunDiskpart("automount disable", out _);
-                    automountDisabled = true;
+                    // automount is a persistent, system-wide setting: only touch (and later restore) it if it is
+                    // on, so a user who switched it off on purpose doesn't find it switched back on.
+                    if (IsAutomountEnabled())
+                    {
+                        RunDiskpart("automount disable", out _);
+                        automountDisabled = true;
+                    }
 
                     // ==========================================================
                     //  STEP 2: diskpart clean — destroy all partitions.
@@ -314,8 +319,11 @@ namespace LinuxSimplify.Services
                     //  STEP 5: Re-enable automount + post-flash cleanup
                     // ==========================================================
                     statusReporter?.Report("Cleaning up...");
-                    RunDiskpart("automount enable", out _);
-                    automountDisabled = false;
+                    if (automountDisabled)
+                    {
+                        RunDiskpart("automount enable", out _);
+                        automountDisabled = false;
+                    }
 
                     Thread.Sleep(1000);
                     CleanupPartitionVisibility(diskNumber);
@@ -337,6 +345,23 @@ namespace LinuxSimplify.Services
                     }
                 }
             });
+        }
+
+        /// <summary>
+        /// diskpart's "automount" stores its state in mountmgr's NoAutoMount value (1 = disabled, missing/0 = enabled).
+        /// Read from the registry because diskpart's own text output is localized.
+        /// </summary>
+        private static bool IsAutomountEnabled()
+        {
+            try
+            {
+                using (var key = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Services\mountmgr"))
+                {
+                    object v = key?.GetValue("NoAutoMount");
+                    return !(v is int i && i != 0);
+                }
+            }
+            catch { return true; } // unknown: behave as before (disable during the write, enable afterwards)
         }
 
         private static int ReadFully(Stream s, byte[] buffer, int count)

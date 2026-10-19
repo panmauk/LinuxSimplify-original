@@ -19,6 +19,8 @@ namespace LinuxSimplify
     ///   --list-usb              USB drives only, JSON
     ///   --analyze               distro compatibility for this machine, JSON
     ///   --resolve [--check]     live URL resolution for every distro; --check also HEADs each ISO and looks up its checksum
+    ///   --check-signatures      live check of every distro's OpenPGP signature (real file valid, tampered copy rejected)
+    ///   --verify-iso NAME ISO URL SUMS [ALGO]  full verification of a downloaded ISO, as the app does it
     ///   --test-flash ISO FILE [HELPER]   exercise the flasher pipeline against a regular FILE (never a device)
     /// </summary>
     public static class Cli
@@ -36,7 +38,7 @@ namespace LinuxSimplify
             switch (args[0])
             {
                 case "--version":
-                    Console.WriteLine("linuxsimplify " + (Assembly.GetExecutingAssembly().GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion?.Split('+')[0] ?? "1.0.0"));
+                    Console.WriteLine("linuxsimplify " + (Assembly.GetExecutingAssembly().GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion?.Split('+')[0] ?? "1.0.1"));
                     return 0;
 
                 case "--scan":
@@ -62,6 +64,19 @@ namespace LinuxSimplify
                 case "--resolve":
                     return ResolveAsync(args.Contains("--check")).GetAwaiter().GetResult();
 
+                case "--check-signatures":
+                    return CheckSignaturesAsync().GetAwaiter().GetResult();
+
+                case "--verify-iso":
+                    // --verify-iso "Distro Name" ISO_PATH DOWNLOAD_URL CHECKSUM_URL [sha256|sha512]
+                    if (args.Length < 5) { Console.Error.WriteLine("usage: --verify-iso NAME ISO URL SUMS_URL [ALGO]"); return 2; }
+                    {
+                        var v = new IsoDownloader().VerifyIsoAsync(args[2], args[1], args[3], args[4], args.Length > 5 ? args[5] : "sha256", "").GetAwaiter().GetResult();
+                        Console.WriteLine($"status={v.Status} signature={v.Signature} signer={v.Signer}");
+                        Console.WriteLine(v.Message);
+                        return v.Status == ChecksumStatus.Verified ? 0 : 1;
+                    }
+
                 case "--test-flash":
                     if (args.Length < 3) { Console.Error.WriteLine("usage: --test-flash ISO TARGET_FILE [HELPER_SCRIPT]"); return 2; }
                     return TestFlashAsync(args[1], args[2], args.Length > 3 ? args[3] : Path.Combine(AppContext.BaseDirectory, "linuxsimplify-flash")).GetAwaiter().GetResult();
@@ -86,6 +101,60 @@ namespace LinuxSimplify
             private readonly Action<T> a;
             public SyncProgress(Action<T> a) { this.a = a; }
             public void Report(T value) { lock (this) a(value); }
+        }
+
+        /// <summary>
+        /// Live check of every distro's checksum-list signature (no ISO download): the real file must verify with
+        /// the pinned key, and the same file with one byte changed must NOT. ISO-signing distros only report
+        /// whether their signature file is reachable and signed by a pinned key.
+        /// </summary>
+        private static async Task<int> CheckSignaturesAsync()
+        {
+            var resolved = await new DistroUrlResolver().ResolveAllAsync();
+            var dl = new IsoDownloader();
+            int failures = 0;
+            foreach (var kv in resolved.OrderBy(k => k.Key))
+            {
+                var r = kv.Value;
+                var spec = SignatureVerifier.For(kv.Key, r.DownloadUrl ?? "", r.Sha256Url ?? "");
+                Console.Write($"{kv.Key,-12} {spec.Kind,-25} ");
+                if (spec.Kind == SignatureKind.None) { Console.WriteLine("(no signature published / key not confirmed: checksum only)"); continue; }
+
+                if (spec.Kind == SignatureKind.DetachedOverIso)
+                {
+                    byte[] isoSig = await dl.DownloadSmallFileAsync(spec.SignatureUrl);
+                    // verifying over an empty stream: a known key gives Invalid (data differs), an unknown key UnknownKey
+                    var res = isoSig == null ? SignatureResult.Unavailable : SignatureVerifier.VerifyDetached(isoSig, new MemoryStream(), spec.KeyFile);
+                    bool ok = res == SignatureResult.Invalid;
+                    if (!ok) failures++;
+                    Console.WriteLine(ok ? "signature file found, signed by the pinned key (verified against the ISO after download)" : $"!! {res}");
+                    continue;
+                }
+
+                byte[] sums = await dl.DownloadSmallFileAsync(r.Sha256Url);
+                if (sums == null) { failures++; Console.WriteLine("!! checksum list not reachable"); continue; }
+                SignatureResult good, tampered;
+                byte[] bad = (byte[])sums.Clone();
+                int pos = Array.IndexOf(bad, (byte)'0');           // flip a hash digit
+                if (pos < 0) pos = bad.Length / 2;
+                bad[pos] = bad[pos] == (byte)'0' ? (byte)'1' : (byte)'0';
+                if (spec.Kind == SignatureKind.ClearSignedChecksumFile)
+                {
+                    good = SignatureVerifier.VerifyClearSigned(sums, spec.KeyFile, out _);
+                    tampered = SignatureVerifier.VerifyClearSigned(bad, spec.KeyFile, out _);
+                }
+                else
+                {
+                    byte[] sig = await dl.DownloadSmallFileAsync(spec.SignatureUrl);
+                    good = sig == null ? SignatureResult.Unavailable : SignatureVerifier.VerifyDetached(sig, new MemoryStream(sums), spec.KeyFile);
+                    tampered = sig == null ? SignatureResult.Unavailable : SignatureVerifier.VerifyDetached(sig, new MemoryStream(bad), spec.KeyFile);
+                }
+                bool pass = good == SignatureResult.Valid && tampered == SignatureResult.Invalid;
+                if (!pass) failures++;
+                Console.WriteLine($"real={good} tampered={tampered} {(pass ? "OK" : "!! FAIL")}");
+            }
+            Console.WriteLine(failures == 0 ? "ALL OK" : $"{failures} PROBLEM(S)");
+            return failures == 0 ? 0 : 1;
         }
 
         private static async Task<int> ResolveAsync(bool check)

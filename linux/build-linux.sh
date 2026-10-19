@@ -65,7 +65,7 @@ done
 CSPROJ="$SCRIPT_DIR/LinuxSimplify.Linux.csproj"
 [ -f "$CSPROJ" ] || die "cannot find $CSPROJ"
 [ -n "$VERSION" ] || VERSION="$(sed -n 's:.*<Version>\(.*\)</Version>.*:\1:p' "$CSPROJ" | head -n1)"
-[ -n "$VERSION" ] || VERSION="1.0.0"
+[ -n "$VERSION" ] || VERSION="1.0.1"
 
 rid_of()       { case "$1" in x64) echo linux-x64 ;; arm64) echo linux-arm64 ;; esac; }
 deb_arch_of()  { case "$1" in x64) echo amd64 ;; arm64) echo arm64 ;; esac; }
